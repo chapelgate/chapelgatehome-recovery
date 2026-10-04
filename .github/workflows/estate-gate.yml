@@ -1,11 +1,79 @@
 name: Chapelgate Estate Gate
 
 on:
-  pull_request:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number for bootstrap verification
+        required: true
+        type: string
 
 permissions:
   contents: read
+  pull-requests: read
+  statuses: write
 
 jobs:
   estate-gate:
-    uses: chapelgate/agent-skills/.github/workflows/estate-gate.yml@eaad988ae6fac76e9d91f815000f62d1b744b427
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Enforce public static recovery boundary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          pr="${EVENT_PR:-${INPUT_PR:-}}"
+          test -n "$pr"
+
+          head_sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq '.head.sha')"
+          base_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq '.base.ref')"
+          body="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq '.body // ""')"
+
+          state=failure
+          finish() {
+            code=$?
+            if [ "$code" -eq 0 ]; then state=success; fi
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha"               -f state="$state"               -f context="estate-gate"               -f description="Chapelgate public static Estate Gate: $state" >/dev/null
+            exit "$code"
+          }
+          trap finish EXIT
+
+          grep -Fq 'Estate-Preflight: yes' <<<"$body"
+          route="$(sed -n 's/^Estate-Route:[[:space:]]*//p' <<<"$body" | head -n1 | tr -d '\r')"
+          case "$route" in
+            TRIVIAL|HIGH_RISK) ;;
+            *) echo "Estate-Route must be TRIVIAL or HIGH_RISK" >&2; exit 2 ;;
+          esac
+          if [ "$route" = HIGH_RISK ]; then
+            grep -Fq 'Estate-Rollback:' <<<"$body"
+          fi
+
+          gate='.github/workflows/estate-gate.yml'
+          gate_exists=false
+          if gh api "repos/$GITHUB_REPOSITORY/contents/$gate?ref=$base_ref" >/dev/null 2>&1; then
+            gate_exists=true
+          fi
+
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            if [ "$file" = "$gate" ]; then
+              if [ "$gate_exists" = true ]; then
+                echo "Estate Gate is immutable through ordinary PRs" >&2
+                exit 3
+              fi
+              [ "$route" = HIGH_RISK ] || { echo "Gate bootstrap requires HIGH_RISK" >&2; exit 4; }
+              continue
+            fi
+            case "$file" in
+              .nojekyll|CNAME|robots.txt|sitemap.xml|*.html|*.md) ;;
+              *) echo "Non-static file rejected: $file" >&2; exit 5 ;;
+            esac
+          done < <(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr/files" --paginate --jq '.[].filename')
+
+          echo "ESTATE_GATE=PASS route=$route"
